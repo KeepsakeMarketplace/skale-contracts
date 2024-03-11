@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+pragma abicoder v2;
+import "../library/Address.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+
+// import "../library/EnumerableSet.sol";
+import "../ERC/IERC721Mintable.sol";
+import './MarketStorage.sol';
+
+// A sample implementation of core ERC1155 function.
+contract Market1155 is MarketStorage {
+
+    modifier marketTokenExists(uint256 marketId, address tokenContract) {
+        require(_marketContracts[tokenContract].owner != address(0), _tokenExists);
+        require(_markets[marketId].owner != address(0), _marketExists);
+        _;
+    }
+
+    function blacklist(address to, bool status) external onlyCommander {
+        _blacklist[to] = status;
+    }
+
+    /** Lets the owner withdraw ETH */
+    function rescueFunds() external onlyCommander {
+        payable(commander()).transfer(address(this).balance);
+    }
+
+    function rescueFunds20(address tokenAddress, uint256 amount) external onlyCommander {
+        require(IERC20(tokenAddress).transfer(_msgSender(), amount));
+    }
+    
+    function rescueFunds721(address tokenAddress, uint256 id) external onlyCommander {
+        IERC721(tokenAddress).transferFrom(address(this), _msgSender(), id);
+    }
+    
+    function rescueFunds1155(address tokenAddress, uint256 id, uint256 amount) external onlyCommander {
+        IERC1155(tokenAddress).safeTransferFrom(address(this), _msgSender(), id, amount, "");
+    }
+
+    // 100 = 1%, 1000 = 10%
+    function setContractOwnerInfo(address contractAddress, address payable owner, uint16 contractType, uint16 saleCut) external onlyOwner() {
+        _marketContracts[contractAddress] = TokenContract(saleCut, owner, contractType);
+    }
+    
+    function setMarket(uint64 marketId, uint16 cutPercentage, address payable owner) external onlyCommander {
+        _markets[marketId] = Market(cutPercentage, owner);
+    }
+
+    function addRequiredOwnership(address contractAddress, uint256 requiredOwnership, address owner) public {
+        _requiredOwnerships.push(RequiredOwnership(contractAddress, requiredOwnership, owner));
+    }
+
+    function UpdateRequiredOwnership(uint256 index, address contractAddress, uint256 requiredOwnership) public {
+        require(_msgSender() == _requiredOwnerships[index].owner || _msgSender() == owner());
+        _requiredOwnerships[index] = RequiredOwnership(contractAddress, requiredOwnership, _msgSender());
+    }
+
+    function buy(uint256 saleId, uint256 amount) external payable {
+        require(saleId < _tokenSales.length);
+        TokenSale storage sale = _tokenSales[saleId];
+        if(sale.requiredOwnershipIndex > 0){
+            require(IERC20(_requiredOwnerships[sale.requiredOwnershipIndex].contractAddress).balanceOf(_msgSender()) >= _requiredOwnerships[sale.requiredOwnershipIndex].requiredOwnership);
+        }
+        uint256 amountCost = sale.price;
+        Market memory market = _markets[sale.marketId];
+        TokenContract memory forSale = _marketContracts[sale.tokenContract];
+        // ERC20
+        if(forSale.contractType == 0) {
+            require(amount <= sale.tokenIdFinish - sale.tokenIdCurrent);
+            sale.tokenIdCurrent = sale.tokenIdCurrent + amount;
+            amountCost = amount * (sale.price / sale.tokenIdFinish);
+            require(IERC20(sale.tokenContract).transfer(_msgSender(), amount));
+        // ERC721
+        } else if(forSale.contractType == 1) {
+          try IERC721(sale.tokenContract).transferFrom(address(this), _msgSender(), sale.tokenIdCurrent) {
+          } catch {
+            IERC721Mintable(sale.tokenContract).mint(_msgSender(), sale.tokenIdCurrent, "");
+          }
+          sale.tokenIdCurrent = sale.tokenIdCurrent + 1;
+        // ERC1155
+        } else if(forSale.contractType == 2) {
+            require(amount <= sale.tokenIdFinish - sale.tokenIdCurrent);
+            amountCost = amount * (sale.price / sale.tokenIdFinish);
+            IERC1155(sale.tokenContract).safeTransferFrom(address(this), _msgSender(), sale.tokenIdStart, amount, "");
+            sale.tokenIdCurrent = sale.tokenIdCurrent + amount;
+        }
+
+        if((forSale.contractType != 1 && sale.tokenIdCurrent == sale.tokenIdFinish) ||
+            (forSale.contractType == 1 && sale.tokenIdCurrent > sale.tokenIdFinish)) {
+            _removeSale(saleId);
+        }
+
+        uint256 ownerCut = (amountCost / 10000) * forSale.cut;
+        uint256 marketOwnerCut =  (amountCost / 10000) *  market.cut;
+
+        // give percentage of sale to owner && marketplace owner
+        if(sale.paymentContract == address(0)){
+            require(msg.value == amountCost, "Must send enough tokens");
+            if(ownerCut > 0 && forSale.owner != address(0)){
+                forSale.owner.transfer(ownerCut);
+            }
+            if(marketOwnerCut > 0){
+                market.owner.transfer(marketOwnerCut);
+            }
+            sale.creator.transfer(amountCost - (ownerCut + marketOwnerCut));
+        } else {
+            if(ownerCut > 0 && forSale.owner != address(0)){
+                require(IERC20(sale.paymentContract).transferFrom(_msgSender(), forSale.owner, ownerCut));
+            }
+            if(marketOwnerCut > 0){
+                require(IERC20(sale.paymentContract).transferFrom(_msgSender(), market.owner, marketOwnerCut));
+            }
+            if(amountCost > (ownerCut + marketOwnerCut)){
+              require(IERC20(sale.paymentContract).transferFrom(_msgSender(), sale.creator, amountCost - (ownerCut + marketOwnerCut)));
+            }
+        }
+    }
+
+    function getSales(uint64 marketId, uint256 start, uint256 length) external view returns(TokenSale[] memory, uint256[] memory, RequiredOwnership[] memory) {
+        uint256 realLength = (start + length > _activeSales[marketId].length) ? _activeSales[marketId].length - start : length;
+        TokenSale[] memory sales = new TokenSale[](realLength);
+        uint256[] memory indexes = new uint256[](realLength);
+        RequiredOwnership[] memory requirements = new RequiredOwnership[](realLength);
+        require(_activeSales[marketId].length > 0);
+        for (uint i=start; i - start < realLength; i++) {
+            sales[i - start] = _tokenSales[_activeSales[marketId][i]];
+            indexes[i - start] = _activeSales[marketId][i];
+            requirements[i - start] = _requiredOwnerships[_tokenSales[_activeSales[marketId][i]].requiredOwnershipIndex];
+        }
+        return (sales, indexes, requirements);
+    }
+
+    function makeSale(SaleInfo memory saleInfo, address tokenContract, address purchaseContract, uint purchaseAmount, uint256 requiredOwnership) marketTokenExists(saleInfo.marketId, tokenContract) external {
+        require(
+            owner() == _msgSender() 
+            || _marketContracts[tokenContract].owner == _msgSender() 
+            || _markets[saleInfo.marketId].owner == _msgSender()
+        );
+
+        uint256 currentId = 0;
+        IERC1155(tokenContract).safeTransferFrom(_msgSender(), address(this), saleInfo.startId, saleInfo.finishId, "");
+        
+        _makeSale(
+            saleInfo,
+            currentId, // uint256 tokenIdCurrent;
+            tokenContract, // address tokenContract;
+            purchaseAmount, // uint256 price;
+            purchaseContract, // address paymentContract;
+            requiredOwnership, // uint256 requiredOwnership; 
+            _msgSender() // address creator;
+        );
+    }
+
+    function updateSaleToken(uint256 saleId, uint256 tokenIdStart, uint256 tokenIdFinish) external {
+        TokenSale storage sale = _tokenSales[saleId];
+        require(owner() == _msgSender() || sale.creator == _msgSender());
+        
+        // start of an ERC721 token set, or tokenId for ERC1155
+        sale.tokenIdStart = tokenIdStart;
+        // end of an ERC721 token set, or number of tokens that were for sale
+        sale.tokenIdFinish = tokenIdFinish;
+    }
+
+        // price per NFT, or all tokens (pirce per token is defined as price / tokenIdFinish)
+    function updateSalePayment(uint256 saleId, uint256 price, address paymentContract) external {
+        TokenSale storage sale = _tokenSales[saleId];
+        require(owner() == _msgSender() || sale.creator == _msgSender());
+        sale.price = price;
+        sale.paymentContract = paymentContract;
+    }
+
+    function updateSaleOwner(uint256 saleId, address payable saleOwner) external {
+        TokenSale storage sale = _tokenSales[saleId];
+        require(owner() == _msgSender() || sale.creator == _msgSender());
+        sale.creator = saleOwner;
+    }
+
+    function updateSaleRequiredOwnership(uint256 saleId, uint256 requiredOwnershipIndex) external {
+        TokenSale storage sale = _tokenSales[saleId];
+        require(owner() == _msgSender() || sale.creator == _msgSender());
+        sale.requiredOwnershipIndex = requiredOwnershipIndex;
+    }
+
+    function removeSale(uint256 saleId) onlyOwner() external {
+        _removeSale(saleId);
+    }
+
+    function _removeSale(uint256 saleId) internal {
+        TokenSale memory sale = _tokenSales[saleId];
+        uint64 marketId = sale.marketId;
+        require(sale.tokenIdFinish != 0);
+        _tokenSales[saleId].tokenIdFinish = 0;
+        if(sale.marketIndex < _activeSales[marketId].length - 1){
+            _activeSales[marketId][sale.marketIndex] = _activeSales[marketId][_activeSales[marketId].length - 1];
+            _tokenSales[_activeSales[marketId].length - 1].marketIndex = sale.marketIndex;
+        }
+        _activeSales[marketId].pop();
+    }
+
+    function adminMakeSale(uint256 startId, uint256 currentId, uint256 finishId,
+        address tokenContract, uint256 purchaseAmount, address purchaseContract, 
+        uint256 requiredOwnership,
+        address payable saleOwner, uint64 marketId) onlyOwner external {
+        _makeSale(startId, currentId, finishId, tokenContract, purchaseAmount, purchaseContract, requiredOwnership, saleOwner, marketId);
+    }
+
+    function onERC1155Received(address operator, address /*from*/, uint256 id, uint256 value, bytes calldata data) external returns(bytes4) {
+        SaleInfo memory sale = SaleInfo(0, id, value);
+        if(data.length > 0){
+            _avoidStackTooDeep(sale, operator, data);
+        }
+        return(0xf23a6e61);
+    }
+
+    function _avoidStackTooDeep(SaleInfo memory sale, address operator, bytes calldata data) internal {
+        (uint256 purchaseAmount, address purchaseContract, uint256 requiredOwnership, uint64 marketId) = abi.decode(data, (uint256, address, uint256, uint64));
+        sale.marketId = marketId;
+        require(
+            owner() == operator 
+            || _marketContracts[_msgSender()].owner == operator 
+            || _markets[marketId].owner == operator
+        );
+        _makeSale(sale, 0, _msgSender(), purchaseAmount, purchaseContract, requiredOwnership, operator);
+    }
+
+    function _makeSale(uint256 startId, uint256 currentId, uint256 finishId,
+        address tokenContract, uint256 purchaseAmount, address purchaseContract, 
+        uint256 requiredOwnership,
+        address saleOwner, uint64 marketId) marketTokenExists(marketId, tokenContract) internal {
+        require(!_blacklist[_msgSender()]);
+        _activeSales[marketId].push(_tokenSales.length);
+        TokenSale memory newSale = TokenSale(
+            startId, // uint256 tokenIdStart;
+            currentId, // uint256 tokenIdCurrent;
+            finishId, // uint256 tokenIdFinish;
+            tokenContract, // address tokenContract;
+            purchaseAmount, // uint256 price;
+            purchaseContract, // address paymentContract;
+            requiredOwnership, //uint256 requiredOwnership;
+            payable(saleOwner), // address creator;
+            marketId, // uint64 marketId;
+            _activeSales[marketId].length - 1 // uint256 marketIndex
+        );
+        _tokenSales.push(newSale);
+    }
+
+    function _makeSale(SaleInfo memory sale, uint256 currentId,
+        address tokenContract, uint256 purchaseAmount, address purchaseContract, 
+        uint256 requiredOwnership,
+        address saleOwner) marketTokenExists(sale.marketId, tokenContract) internal {
+        require(!_blacklist[_msgSender()]);
+        _activeSales[sale.marketId].push(_tokenSales.length);
+        TokenSale memory newSale = TokenSale(
+            sale.startId, // uint256 tokenIdStart;
+            currentId, // uint256 tokenIdCurrent;
+            sale.finishId, // uint256 tokenIdFinish;
+            tokenContract, // address tokenContract;
+            purchaseAmount, // uint256 price;
+            purchaseContract, // address paymentContract;
+            requiredOwnership, //uint256 requiredOwnership;
+            payable(saleOwner), // address creator;
+            sale.marketId, // uint64 marketId;
+            _activeSales[sale.marketId].length - 1 // uint256 marketIndex
+        );
+        _tokenSales.push(newSale);
+    }
+    
+}
