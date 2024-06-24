@@ -42,12 +42,12 @@ contract Market721 is MarketStorage, IERC721Receiver {
     }
 
     // 100 = 1%, 1000 = 10%
-    function setContractOwnerInfo(address contractAddress, address payable owner, uint16 saleCut) external /**topUp*/ onlyOwner() {
-        _marketContracts[contractAddress] = TokenContract(saleCut, owner);
+    function setContractOwnerInfo(address contractAddress, address owner, uint16 saleCut, address payable feeReceiver) external /**topUp*/ onlyOwner() {
+        _marketContracts[contractAddress] = TokenContract(saleCut, owner, feeReceiver);
     }
     
-    function setMarket(uint64 marketId, uint16 cutPercentage, address payable owner) external /**topUp*/ onlyOwner {
-        _markets[marketId] = Market(cutPercentage, owner);
+    function setMarket(uint64 marketId, uint16 cutPercentage, address owner, address payable feeReceiver) external /**topUp*/ onlyOwner {
+        _markets[marketId] = Market(cutPercentage, owner, feeReceiver);
     }
 
     function buy(uint256 saleId, uint256 price) external /**topUp*/ nonReentrant {
@@ -69,11 +69,11 @@ contract Market721 is MarketStorage, IERC721Receiver {
 
         IERC20 token = IERC20(sale.paymentContract);
         // give percentage of sale to owner && marketplace owner
-        if(tokenContractCut > 0 && tokenContract.owner != address(0)){
-            SafeERC20.safeTransferFrom(token, _msgSender(), tokenContract.owner, tokenContractCut);
+        if(tokenContractCut > 0 && tokenContract.feeReceiver != address(0)){
+            SafeERC20.safeTransferFrom(token, _msgSender(), tokenContract.feeReceiver, tokenContractCut);
         }
         if(marketOwnerCut > 0){
-            SafeERC20.safeTransferFrom(token, _msgSender(), market.owner, marketOwnerCut);
+            SafeERC20.safeTransferFrom(token, _msgSender(), market.feeReceiver, marketOwnerCut);
         }
         if(amountCost > (tokenContractCut + marketOwnerCut)){
             SafeERC20.safeTransferFrom(token, _msgSender(), sale.creator, amountCost - (tokenContractCut + marketOwnerCut));
@@ -100,7 +100,21 @@ contract Market721 is MarketStorage, IERC721Receiver {
             tokenContract, // address tokenContract;
             price, // uint256 price;
             paymentContract, // address paymentContract;
-            _msgSender() // address creator;
+            _msgSender(), // address creator;
+            payable(_msgSender()) // address feeReceiver;
+        );
+    }
+    
+    function sellFor(uint64 marketId, uint256 tokenId, address tokenContract, address paymentContract, uint price, address payable feeReceiver) external /**topUp*/ nonReentrant {
+        IERC721(tokenContract).transferFrom(_msgSender(), address(this), tokenId);
+        _makeSale(
+            marketId,
+            tokenId, // uint256 tokenIdCurrent;
+            tokenContract, // address tokenContract;
+            price, // uint256 price;
+            paymentContract, // address paymentContract;
+            _msgSender(), // address creator;
+            feeReceiver // address feeReceiver;
         );
     }
 
@@ -130,8 +144,8 @@ contract Market721 is MarketStorage, IERC721Receiver {
 
     function onERC721Received(address operator, address /*from*/, uint256 tokenId, bytes calldata data) external override returns(bytes4) {
         if(data.length > 0){
-            (uint256 price, address paymentContract, uint64 marketId) = abi.decode(data, (uint256, address, uint64));
-            _makeSale(marketId, tokenId, _msgSender(), price, paymentContract, operator);
+            (uint256 price, address paymentContract, uint64 marketId, address feeReceiver) = abi.decode(data, (uint256, address, uint64, address));
+            _makeSale(marketId, tokenId, _msgSender(), price, paymentContract, operator, payable(feeReceiver));
         }
         return(0x150b7a02);
     }
@@ -139,7 +153,7 @@ contract Market721 is MarketStorage, IERC721Receiver {
     function _makeSale(
         uint64 marketId, uint256 tokenId, 
         address tokenContract, uint256 price, address paymentContract, 
-        address creator) marketExists(marketId) internal {
+        address creator, address payable feeReceiver) marketExists(marketId) internal {
         // require(!_blacklist[_msgSender()]);
         TokenSale memory newSale = TokenSale(
             tokenId,
@@ -147,8 +161,9 @@ contract Market721 is MarketStorage, IERC721Receiver {
             price, // uint256 price;
             paymentContract, // address paymentContract;
             payable(creator), // address creator;
+            feeReceiver, // address payable feeReceiver
             marketId, // uint64 marketId;
-            false
+            false // bool finished
         );
         _tokenSales.push(newSale);
         emit SaleCreated(marketId, _tokenSales.length - 1, tokenContract, tokenId, price, paymentContract, creator);
