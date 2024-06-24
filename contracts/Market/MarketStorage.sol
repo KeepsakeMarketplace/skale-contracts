@@ -17,7 +17,8 @@ contract MarketStorage is BigOwnable, ReentrancyGuard {  /**, EtherbaseUsage*/
         // price per NFT, or all tokens (pirce per token is defined as price / tokenIdFinish)
         uint256 price;
         address paymentContract;
-        address payable creator;
+        address creator;
+        address payable feeReceiver;
         uint64 marketId;
         bool finished;
     }
@@ -30,12 +31,14 @@ contract MarketStorage is BigOwnable, ReentrancyGuard {  /**, EtherbaseUsage*/
     // 100 = 1%
     struct Market {
         uint16 cut;
-        address payable owner;
+        address owner;
+        address payable feeReceiver;
     }
 
     struct TokenContract {
         uint16 cut;
-        address payable owner;
+        address owner;
+        address payable feeReceiver;
     }
 
     mapping (address => TokenContract) public _marketContracts;
